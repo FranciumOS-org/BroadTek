@@ -91,6 +91,19 @@ def main():
         run('install', fresh(), tmp, expect_fail=True, stage='sideways')
         run('uninstall', fresh(), tmp, expect_fail=True, stage='full')
 
+        # Intel: BTLEAdvFixup goes off with install and back on with
+        # uninstall, but only when it was install that turned it off.
+        rival = lambda c: next(x for x in c['Kernel']['Add'] if x['BundlePath'] == 'BTLEAdvFixup.kext')
+        withfix = fresh()
+        withfix['Kernel']['Add'].append({'BundlePath': 'BTLEAdvFixup.kext', 'Enabled': True})
+        on = run('install', withfix, tmp)
+        assert rival(on)['Enabled'] is False, 'install must switch BTLEAdvFixup off'
+        assert rival(run('uninstall', on, tmp))['Enabled'] is True, 'uninstall must switch it back on'
+        mine = fresh()
+        mine['Kernel']['Add'].append({'BundlePath': 'BTLEAdvFixup.kext', 'Enabled': False})
+        assert rival(run('uninstall', run('install', mine, tmp), tmp))['Enabled'] is False, \
+            'a BTLEAdvFixup the user had off must stay off'
+
         no_lilu = fresh()
         no_lilu['Kernel']['Add'] = [x for x in no_lilu['Kernel']['Add']
                                     if x['BundlePath'] != 'Lilu.kext']

@@ -504,6 +504,43 @@ static void test_install_and_resolve(void)
     CHECK(c.resolved == 1, "one resolution counted, got %u", c.resolved);
     CHECK(c.substituted == 1, "one substitution counted, got %u", c.substituted);
 
+    /* The helper re-installs the same key every few minutes: that must not
+     * forget the sighting, or the accept list loses the RPA until the next
+     * advert. A different key for the identity does start over. */
+    CHECK(c.rl[0].have_rpa, "the report gave a sighting");
+    CHECK(bt_rl_install(&c, 0x00, id_addr, spec_irk) == 1, "the same key again");
+    CHECK(c.rl[0].have_rpa, "the same key again must keep the sighting");
+    {
+        uint8_t other[16];
+        memcpy(other, spec_irk, 16);
+        other[15] ^= 0x01;
+        CHECK(bt_rl_install(&c, 0x00, id_addr, other) == 1, "a new key for the identity");
+        CHECK(!c.rl[0].have_rpa, "a new key must drop the old sighting");
+        CHECK(bt_rl_install(&c, 0x00, id_addr, spec_irk) == 1, "and the first key back");
+    }
+
+    /* bluetoothd clears the list as it starts, which can come after the key
+     * helper has run at boot: the installed key must survive it, while an
+     * entry bluetoothd added itself goes as the controller's would. */
+    {
+        uint8_t add[3 + 39] = {0x27, 0x20, 39, 0x00, 1, 2, 3, 4, 5, 6};
+        bt_hci_on_command(&c, add, sizeof(add));      /* bluetoothd adds one of its own */
+        int before = 0;
+        for (int i = 0; i < BT_RL_SIZE; i++) if (c.rl[i].valid) before++;
+        CHECK(before == 2, "two entries before the clear, got %d", before);
+        uint8_t clear[3] = {0x29, 0x20, 0x00};
+        bt_hci_on_command(&c, clear, sizeof(clear));
+        int after = 0, ours = -1;
+        for (int i = 0; i < BT_RL_SIZE; i++)
+            if (c.rl[i].valid) { after++; ours = i; }
+        CHECK(after == 1, "the clear must leave only the installed key, got %d", after);
+        CHECK(ours >= 0 && memcmp(c.rl[ours].id_addr, id_addr, 6) == 0, "and it is the Watch's");
+        uint8_t del[3 + 7] = {0x28, 0x20, 7, 0x00};
+        memcpy(&del[4], id_addr, 6);
+        bt_hci_on_command(&c, del, sizeof(del));
+        CHECK(c.rl[ours].valid, "bluetoothd's delete must leave the installed key too");
+    }
+
     /* A key that matches nothing must count nothing. */
     struct bt_ctx w;
     bt_ctx_init(&w);

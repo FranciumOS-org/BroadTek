@@ -128,7 +128,14 @@ int bt_rl_install(struct bt_ctx *c, uint8_t id_type, const uint8_t id_addr[6],
             if (!c->rl[i].valid) e = &c->rl[i];
     if (e == NULL) return 0;
 
+    /* The same key again (the helper re-installs it every few minutes):
+     * keep the sighting, so resolution does not lapse until the next advert. */
+    int same = e->valid && e->have_irk;
+    for (int i = 0; same && i < 16; i++) same = e->irk[i] == irk[i];
+    if (same) { e->pinned = 1; return 1; }
+
     e->valid = 1;
+    e->pinned = 1;
     e->id_type = (uint8_t)(id_type & 1);
     bcopy6(e->id_addr, id_addr);
     for (int i = 0; i < 16; i++) e->irk[i] = irk[i];
@@ -154,6 +161,7 @@ int bt_rl_install_map(struct bt_ctx *c, uint8_t id_type, const uint8_t id_addr[6
      * handed-down address simply becomes its current sighting. */
     bcopy6(e->rpa, rpa);
     e->have_rpa = 1;
+    e->pinned = 1;
     return 1;
 }
 
@@ -171,9 +179,11 @@ enum bt_verdict bt_hci_on_command(struct bt_ctx *c, uint8_t *pkt, size_t len)
     case OP_LE_ADD_RL: {                     /* type, addr[6], peer IRK[16], local IRK[16] */
         if (plen < 39) break;
         struct bt_rl_entry *e = rl_find(c, p[0], &p[1]);
-        if (e == NULL)
+        if (e == NULL) {
             for (int i = 0; i < BT_RL_SIZE && e == NULL; i++)
                 if (!c->rl[i].valid) e = &c->rl[i];
+            if (e != NULL) e->pinned = 0;    /* a free slot: bluetoothd's own entry */
+        }
         if (e == NULL) break;                /* full: the controller's refusal stands */
         e->valid = 1;
         e->id_type = p[0] & 1;
@@ -187,12 +197,14 @@ enum bt_verdict bt_hci_on_command(struct bt_ctx *c, uint8_t *pkt, size_t len)
     case OP_LE_DEL_RL: {
         if (plen < 7) break;
         struct bt_rl_entry *e = rl_find(c, p[0], &p[1]);
-        if (e != NULL) e->valid = 0;
+        if (e != NULL && !e->pinned) e->valid = 0;
         answer(c, opcode, NULL, 0);
         break;
     }
     case OP_LE_CLEAR_RL:
-        for (int i = 0; i < BT_RL_SIZE; i++) c->rl[i].valid = 0;
+        /* bluetoothd clears the list as it starts, which can come after the
+         * key helper has already installed the Watch's key at boot. */
+        for (int i = 0; i < BT_RL_SIZE; i++) if (!c->rl[i].pinned) c->rl[i].valid = 0;
         answer(c, opcode, NULL, 0);
         break;
     case OP_LE_RL_SIZE: {

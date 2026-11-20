@@ -27,6 +27,8 @@ struct bt_rl_entry {
     uint8_t have_irk;       /* 0 for an entry whose address was handed down */
     uint8_t have_rpa;
     uint8_t rpa[6];         /* last RPA seen for this identity */
+    uint8_t pinned;         /* installed from userspace: bluetoothd's own clear
+                             * and delete leave it, since it never added it */
 };
 
 /* A command BroadTek answered on the controller's behalf: when its Command

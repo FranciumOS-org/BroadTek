@@ -10,6 +10,7 @@
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_util.hpp>
 #include <IOKit/IOLib.h>
+#include <kern/thread_call.h>
 #include <sys/vnode.h>
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
@@ -86,6 +87,14 @@ static IOSimpleLock *g_lock;
  * Command Complete. That reply becomes the NOP credit update, so bluetoothd
  * never sees an answer to a command it did not send. */
 static bool g_adv_addr;
+/* Set once an Intel Bluetooth device appears on USB (or by -broadtekintel). */
+static volatile bool g_intel;
+static volatile SInt32 g_intel_inj_pending;
+static OSNumber *g_n_intel_pages;
+/* Completion context: the link-ready reports (below). Returns the new length
+ * if it rewrote buf, 0 to pass the event on as it is. */
+static size_t intelOnEvent(uint8_t *buf, size_t len, size_t room);
+
 static uint8_t g_adv_rpa[6];
 static bool g_adv_have_rpa;
 static uint8_t g_adv_random[16];        /* per set: own type random in the last 0x2036 */
@@ -1228,6 +1237,39 @@ static void completionTrampoline(void *owner, void *parameter, IOReturn status, 
                     return;
                 }
 
+                /* Intel: link-ready reports, and the replies to our own
+                 * commands that become them. */
+                if (g_intel) {
+                    size_t nl = intelOnEvent(buf, len, room);
+                    if (nl != 0) {
+                        writeMD(md, buf, nl);
+                        deliver = static_cast<uint32_t>(nl);
+                        s->md = nullptr;
+                        OSDecrementAtomic(&s->busy);
+                        if (orig.action != nullptr)
+                            orig.action(owner != nullptr ? owner : orig.owner, orig.parameter,
+                                        status, deliver);
+                        return;
+                    }
+                }
+
+                /* Our own 0x2005's reply (Intel). bluetoothd's command that
+                 * triggered it is held until this arrives, so while one is
+                 * pending the next 0x2005 reply is ours. */
+                if (g_intel_inj_pending > 0 && buf[0] == 0x0e && len >= 6 &&
+                    buf[3] == 0x05 && buf[4] == 0x20) {
+                    OSDecrementAtomic(&g_intel_inj_pending);
+                    buf[1] = 0x03; buf[3] = 0x00; buf[4] = 0x00;   /* keep num_packets */
+                    writeMD(md, buf, 5);
+                    deliver = 5;
+                    s->md = nullptr;
+                    OSDecrementAtomic(&s->busy);
+                    if (orig.action != nullptr)
+                        orig.action(owner != nullptr ? owner : orig.owner, orig.parameter,
+                                    status, deliver);
+                    return;
+                }
+
                 /* Command Complete: num_packets, opcode, status, ...
                  * Command Status:  status, num_packets, opcode, ... */
                 if (buf[0] == 0x0e && len >= 5)
@@ -1630,6 +1672,307 @@ static void advBeforeCommand(void *that, uint8_t pipeRef, const StandardUSB::Dev
     }
 }
 
+/*
+ * Intel, on the HCI stream. Two things a spec-strict controller needs that
+ * bluetoothd does not give an unknown chipset:
+ *
+ *  - LE Set Event Mask (0x2001) without bit 12, LE Extended Advertising
+ *    Report. Once scanning is extended (above) that is the only report the
+ *    controller sends, and masked off it sends none: nothing nearby is seen.
+ *  - A scan with a random own address before any random address is set.
+ *    bluetoothd sets one only for advertising, so a legacy LE Set Scan
+ *    Parameters (0x200b) asking for a random address after a reset fails.
+ *    Before the first such command a static random address (the two top bits
+ *    set) goes out in LE Set Random Address (0x2005). bluetoothd's own 0x2005,
+ *    when it sends one, replaces it.
+ */
+static uint8_t g_intel_static[6];
+static bool g_intel_have_random;
+static uint64_t g_intel_masked, g_intel_rand_sent;
+static OSNumber *g_n_intel_masked, *g_n_intel_rand_sent;
+
+static void intelMakeStaticAddress()
+{
+    /* Per boot, not secret: the address only has to be a valid static one. */
+    uint64_t t = mach_absolute_time();
+    for (int i = 0; i < 6; i++) {
+        t = t * 6364136223846793005ull + 1442695040888963407ull;
+        g_intel_static[i] = static_cast<uint8_t>(t >> 56);
+    }
+    g_intel_static[5] |= 0xc0;
+}
+
+/* Caller context, bluetoothd's thread: may block, like advSendSetAddress. */
+static void intelSendRandomAddress(void *that, uint8_t pipeRef, const StandardUSB::DeviceRequest &like,
+                                   uint32_t timeout)
+{
+    uint8_t cmd[9] = { 0x05, 0x20, 6 };
+    memcpy(&cmd[3], g_intel_static, 6);
+    IOMemoryDescriptor *md = ownedCopy(cmd, sizeof(cmd));
+    if (md == nullptr) return;
+
+    StandardUSB::DeviceRequest req = like;
+    req.wLength = sizeof(cmd);
+    uint32_t sent = 0;
+    OSIncrementAtomic(&g_intel_inj_pending);
+    IOReturn r = FunctionCast(onUserClientControlRequest, g_orig_uc_ctrl)(that, pipeRef, req, md,
+                                                                          nullptr, sent, timeout);
+    md->release();
+    if (r != kIOReturnSuccess) { OSDecrementAtomic(&g_intel_inj_pending); return; }
+    g_intel_have_random = true;
+    g_intel_rand_sent++;
+    if (g_n_intel_rand_sent != nullptr) g_n_intel_rand_sent->setValue(g_intel_rand_sent);
+    for (int i = 0; i < 100 && g_intel_inj_pending > 0; i++) IOSleep(1);
+}
+
+/* Caller context. Returns true if it changed buf. */
+static bool intelBeforeCommand(void *that, uint8_t pipeRef, const StandardUSB::DeviceRequest &request,
+                               uint8_t *buf, size_t len, uint32_t timeout)
+{
+    if (!g_intel || len < 3) return false;
+    uint16_t opcode = static_cast<uint16_t>(buf[0] | (buf[1] << 8));
+    uint8_t plen = buf[2];
+    uint8_t *p = &buf[3];
+    if (len < static_cast<size_t>(3) + plen) return false;
+
+    switch (opcode) {
+    case 0x0c03:                                    /* HCI Reset */
+        g_intel_have_random = false;
+        return false;
+    case 0x2005:
+        g_intel_have_random = true;
+        return false;
+    case 0x2001:
+        /* bit 12 extended advertising report; bits 6 and 11, Data Length
+         * Change and PHY Update Complete, are the link-ready reports. */
+        if (plen < 8 || ((p[1] & 0x18) == 0x18 && (p[0] & 0x40))) return false;
+        p[0] |= 0x40;
+        p[1] |= 0x18;
+        g_intel_masked++;
+        if (g_n_intel_masked != nullptr) g_n_intel_masked->setValue(g_intel_masked);
+        return true;
+    case 0x200b:
+        /* type, interval, window, own address type, filter policy */
+        if (plen >= 7 && (p[5] == 0x01 || p[5] == 0x03) && !g_intel_have_random)
+            intelSendRandomAddress(that, pipeRef, request, timeout);
+        return false;
+    case 0x2041:
+        /* LE Set Extended Scan Parameters: own address type first */
+        if (plen >= 1 && (p[0] == 0x01 || p[0] == 0x03) && !g_intel_have_random)
+            intelSendRandomAddress(that, pipeRef, request, timeout);
+        return false;
+    default:
+        return false;
+    }
+}
+
+/*
+ * Intel: the link-ready reports.
+ *
+ * After an LE connection, bluetoothd holds the link back from every app until
+ * the controller has reported the link's PHY (LE PHY Update Complete) and its
+ * packet sizes (LE Data Length Change) -- "ready: wait-for-features ... EDL
+ * [remote 1, local 1], 2M [remote 1, local 1] PHYReady:no" in its log. It
+ * never asks for either; Apple's own chips start both procedures themselves
+ * and report them. The AX210 reports neither, so the link sits in
+ * "connecting" for the apps: Watch unlock's WirelessProximity connection
+ * times out after 10 s on a link that is up and encrypted, and the Watch hangs
+ * up.
+ *
+ * So, once the remote features are in (LE Read Remote Features Complete),
+ * BroadTek waits a moment for real reports and, for each one still missing,
+ * asks the controller itself and hands the answer to bluetoothd in the form it
+ * waits for:
+ *   - LE Read PHY (0x2030): its reply becomes LE PHY Update Complete carrying
+ *     the link's real PHYs;
+ *   - LE Set Data Length (0x2022, 251 octets): the controller negotiates for
+ *     real, and its reply becomes LE Data Length Change with the minimum
+ *     27 octets / 328 us, which holds on every link; a real Data Length
+ *     Change, when the controller sends one, follows and corrects it.
+ * The event mask also gains both reports (0x2001 above), so a controller that
+ * does send them is passed through untouched and nothing is made up.
+ */
+enum { kOwnNop = 1, kOwnToPhy = 2, kOwnToDle = 3 };
+struct OwnReply { volatile uint8_t used; uint8_t action; uint16_t opcode; uint16_t handle; };
+static OwnReply g_own[4];
+struct LinkReady { uint8_t used, phy, dle, queued; uint16_t handle; };
+static LinkReady g_links[8];
+static uint16_t g_ready_queue[8];
+static int g_ready_queued;
+static IOSimpleLock *g_intel_lock;
+static thread_call_t g_ready_call;
+static OSObject *g_uc_client;
+static uint8_t g_uc_pipe;
+static StandardUSB::DeviceRequest g_uc_req;
+static uint32_t g_uc_timeout;
+static volatile SInt32 g_own_busy;
+static uint64_t g_ready_phy, g_ready_dle, g_ready_real;
+static OSNumber *g_n_ready_phy, *g_n_ready_dle, *g_n_ready_real;
+
+/* Caller context (bluetoothd's thread). Keeps the client our own commands go
+ * through, and holds bluetoothd's command back while one of ours is out, so
+ * the controller never has two at once. */
+static void intelNoteClient(void *that, uint8_t pipeRef, const StandardUSB::DeviceRequest &request,
+                            uint32_t timeout)
+{
+    for (int i = 0; i < 300 && g_own_busy > 0; i++) IOSleep(1);
+    if (g_intel_lock == nullptr) return;
+    OSObject *nu = static_cast<OSObject *>(that), *old = nullptr;
+    IOSimpleLockLock(g_intel_lock);
+    if (g_uc_client != nu) {
+        if (nu != nullptr) nu->retain();
+        old = g_uc_client;
+        g_uc_client = nu;
+    }
+    g_uc_pipe = pipeRef;
+    g_uc_req = request;
+    g_uc_timeout = timeout;
+    IOSimpleLockUnlock(g_intel_lock);
+    if (old != nullptr) old->release();
+}
+
+static LinkReady *linkFor(uint16_t h, bool make)
+{
+    for (auto &l : g_links) if (l.used && l.handle == h) return &l;
+    if (!make) return nullptr;
+    for (auto &l : g_links) if (!l.used) { l = LinkReady{1, 0, 0, 0, h}; return &l; }
+    g_links[0] = LinkReady{1, 0, 0, 0, h};
+    return &g_links[0];
+}
+
+/* Thread context. One command of ours, out and answered (or given up on). */
+static void intelSendOwn(const uint8_t *cmd, size_t n, uint8_t action, uint16_t handle)
+{
+    IOSimpleLockLock(g_intel_lock);
+    OSObject *client = g_uc_client;
+    if (client != nullptr) client->retain();
+    uint8_t pipeRef = g_uc_pipe;
+    StandardUSB::DeviceRequest req = g_uc_req;
+    uint32_t timeout = g_uc_timeout;
+    IOSimpleLockUnlock(g_intel_lock);
+    if (client == nullptr) return;
+
+    OwnReply *slot = nullptr;
+    for (auto &o : g_own) if (!o.used) { slot = &o; break; }
+    IOMemoryDescriptor *md = slot != nullptr ? ownedCopy(cmd, n) : nullptr;
+    if (md == nullptr) { client->release(); return; }
+
+    slot->action = action;
+    slot->opcode = static_cast<uint16_t>(cmd[0] | (cmd[1] << 8));
+    slot->handle = handle;
+    OSSynchronizeIO();
+    slot->used = 1;
+    OSIncrementAtomic(&g_own_busy);
+
+    req.wLength = static_cast<uint16_t>(n);
+    uint32_t sent = 0;
+    IOReturn r = FunctionCast(onUserClientControlRequest, g_orig_uc_ctrl)(client, pipeRef, req, md,
+                                                                          nullptr, sent, timeout);
+    md->release();
+    if (r != kIOReturnSuccess) slot->used = 0;
+    for (int i = 0; i < 300 && slot->used; i++) IOSleep(1);
+    slot->used = 0;                 /* a late reply passes as it is */
+    OSDecrementAtomic(&g_own_busy);
+    client->release();
+}
+
+static void intelReadyWork(thread_call_param_t, thread_call_param_t)
+{
+    IOSleep(200);                   /* time for a controller to report by itself */
+    for (;;) {
+        uint16_t h;
+        IOSimpleLockLock(g_intel_lock);
+        if (g_ready_queued == 0) { IOSimpleLockUnlock(g_intel_lock); return; }
+        h = g_ready_queue[--g_ready_queued];
+        LinkReady *l = linkFor(h, false);
+        bool needPhy = l != nullptr && !l->phy, needDle = l != nullptr && !l->dle;
+        if (l != nullptr) l->queued = 0;
+        IOSimpleLockUnlock(g_intel_lock);
+
+        if (needPhy) {
+            uint8_t cmd[5] = { 0x30, 0x20, 2, static_cast<uint8_t>(h), static_cast<uint8_t>(h >> 8) };
+            intelSendOwn(cmd, sizeof(cmd), kOwnToPhy, h);
+        }
+        if (needDle) {
+            uint8_t cmd[9] = { 0x22, 0x20, 6, static_cast<uint8_t>(h), static_cast<uint8_t>(h >> 8),
+                               0xfb, 0x00, 0x48, 0x08 };            /* 251 octets, 2120 us */
+            intelSendOwn(cmd, sizeof(cmd), kOwnToDle, h);
+        }
+    }
+}
+
+static size_t intelOnEvent(uint8_t *buf, size_t len, size_t room)
+{
+    /* The replies to our own commands. */
+    if ((buf[0] == 0x0e && len >= 6) || (buf[0] == 0x0f && len >= 6)) {
+        bool cc = buf[0] == 0x0e;
+        uint16_t op = cc ? static_cast<uint16_t>(buf[3] | (buf[4] << 8))
+                         : static_cast<uint16_t>(buf[4] | (buf[5] << 8));
+        uint8_t credits = cc ? buf[2] : buf[3];
+        uint8_t st = cc ? buf[5] : buf[2];
+        for (auto &o : g_own) {
+            if (!o.used || o.opcode != op) continue;
+            uint16_t h = o.handle;
+            uint8_t action = o.action;
+            o.used = 0;
+            if (action == kOwnToPhy && room >= 8) {
+                /* Read PHY: status, handle(2), tx, rx */
+                uint8_t tx = (st == 0 && len >= 10) ? buf[8] : 1, rx = (st == 0 && len >= 10) ? buf[9] : 1;
+                const uint8_t ev[8] = { 0x3e, 6, 0x0c, 0x00, static_cast<uint8_t>(h),
+                                        static_cast<uint8_t>(h >> 8), tx, rx };
+                memcpy(buf, ev, sizeof(ev));
+                g_ready_phy++;
+                if (g_n_ready_phy != nullptr) g_n_ready_phy->setValue(g_ready_phy);
+                return sizeof(ev);
+            }
+            if (action == kOwnToDle && room >= 13) {
+                const uint8_t ev[13] = { 0x3e, 11, 0x07, static_cast<uint8_t>(h), static_cast<uint8_t>(h >> 8),
+                                         27, 0, 0x48, 0x01, 27, 0, 0x48, 0x01 };
+                memcpy(buf, ev, sizeof(ev));
+                g_ready_dle++;
+                if (g_n_ready_dle != nullptr) g_n_ready_dle->setValue(g_ready_dle);
+                return sizeof(ev);
+            }
+            const uint8_t nop[5] = { 0x0e, 3, credits, 0x00, 0x00 };
+            memcpy(buf, nop, sizeof(nop));
+            return sizeof(nop);
+        }
+        return 0;
+    }
+
+    if (buf[0] != 0x3e || len < 6) return 0;
+    uint8_t sub = buf[2];
+    if (sub == 0x01 || sub == 0x0a || sub == 0x29) {       /* a new link */
+        if (buf[3] != 0) return 0;
+        uint16_t h = static_cast<uint16_t>((buf[4] | (buf[5] << 8)) & 0x0fff);
+        IOSimpleLockLock(g_intel_lock);
+        LinkReady *l = linkFor(h, true);
+        *l = LinkReady{1, 0, 0, 0, h};
+        IOSimpleLockUnlock(g_intel_lock);
+    } else if (sub == 0x0c || sub == 0x07) {               /* a real report */
+        uint16_t h = static_cast<uint16_t>(((sub == 0x0c ? buf[4] | (buf[5] << 8)
+                                                         : buf[3] | (buf[4] << 8))) & 0x0fff);
+        IOSimpleLockLock(g_intel_lock);
+        if (LinkReady *l = linkFor(h, false)) { if (sub == 0x0c) l->phy = 1; else l->dle = 1; }
+        IOSimpleLockUnlock(g_intel_lock);
+        g_ready_real++;
+        if (g_n_ready_real != nullptr) g_n_ready_real->setValue(g_ready_real);
+    } else if (sub == 0x04 && buf[3] == 0x00) {            /* remote features in */
+        uint16_t h = static_cast<uint16_t>((buf[4] | (buf[5] << 8)) & 0x0fff);
+        bool go = false;
+        IOSimpleLockLock(g_intel_lock);
+        LinkReady *l = linkFor(h, true);
+        if (!l->queued && (!l->phy || !l->dle) && g_ready_queued < 8) {
+            l->queued = 1;
+            g_ready_queue[g_ready_queued++] = h;
+            go = true;
+        }
+        IOSimpleLockUnlock(g_intel_lock);
+        if (go && g_ready_call != nullptr) thread_call_enter(g_ready_call);
+    }
+    return 0;
+}
+
 /* bluetoothd does HCI from userspace: it opens the dongle's interface through
  * AppleUSBHostInterfaceUserClient and sends each command as a control request.
  * That never reaches IOUSBHostPipe::controlRequest — the first hardware run
@@ -1667,22 +2010,26 @@ static IOReturn onUserClientControlRequest(void *that, uint8_t pipeRef,
             noteOpcode(g_ops_uc, opcode);
             noteConnTarget(buf, len);
             advBeforeCommand(that, pipeRef, request, buf, len, timeout);
+            bool intelEdited = intelBeforeCommand(that, pipeRef, request, buf, len, timeout);
+            if (g_intel) intelNoteClient(that, pipeRef, request, timeout);
 
-            if (g_rw_cmds) {
+            if (g_rw_cmds || intelEdited) {
                 /* A digest rather than a second 260-byte buffer on the stack.
                  * Any edit must be noticed, not only an address swap. */
                 uint32_t before = 0;
                 for (size_t i = 0; i < len; i++) before = before * 31u + buf[i];
 
-                IOSimpleLockLock(g_lock);
-                bt_hci_on_command(&g_ctx, buf, len);
-                IOSimpleLockUnlock(g_lock);
-                if (g_n_substituted != nullptr) g_n_substituted->setValue(g_ctx.substituted);
+                if (g_rw_cmds) {
+                    IOSimpleLockLock(g_lock);
+                    bt_hci_on_command(&g_ctx, buf, len);
+                    IOSimpleLockUnlock(g_lock);
+                    if (g_n_substituted != nullptr) g_n_substituted->setValue(g_ctx.substituted);
+                }
 
                 uint32_t after = 0;
                 for (size_t i = 0; i < len; i++) after = after * 31u + buf[i];
 
-                if (after != before) {
+                if (after != before || intelEdited) {
                     owned = ownedCopy(buf, len);
                     if (owned != nullptr) {
                         if (completion != nullptr) {
@@ -1954,6 +2301,43 @@ static UserPatcher::BinaryModPatch g_btd_patches[] = {
     { CPU_TYPE_X86_64, 0, g_multi_find, g_multi_repl, sizeof(g_multi_find), 0, 1, UserPatcher::FileSegment::SegmentTextText, 1 },
     { CPU_TYPE_X86_64, 0, g_count_find, g_count_repl, sizeof(g_count_find), 0, 1, UserPatcher::FileSegment::SegmentTextText, 1 },
 };
+/*
+ * Intel controllers (AX200, AX201, AX210, AX211: USB vendor 0x8087) follow the
+ * spec where the Realtek did not: once bluetoothd has used an extended
+ * advertising command, they refuse the legacy scan and create-connection
+ * commands. bluetoothd keeps using those because it also asks the chipset
+ * whether it supports extended scanning (vtable slot 0x9a8) and whether to use
+ * LE Extended Create Connection (0x2043), and an unknown chipset gets "no" to
+ * both. So on Intel two more answers change:
+ *
+ *  - the extended-scan query returns 1, like the advertising ones above;
+ *  - the setter of the "use 0x2043" flag stores 1 whatever it is given
+ *    (movb %dil -> movb $1, same length and the same rip displacement).
+ *
+ * Both from macOS 26.7.3 (25G342), each checked to occur once in the file.
+ * Not applied to Realtek, where the legacy commands work and these were never
+ * tried.
+ */
+static const uint8_t g_xscan_find[] = { 0x55,0x48,0x89,0xe5,0x8b,0x8f,0x34,0x03,0x00,0x00,0x85,0xc9,
+    0x74,0x12,0x81,0xf9,0xcf,0x07,0x00,0x00,0x77,0x15,0x8d,0x51,0xed,0xb0,0x01,0x83,0xfa,0x07,
+    0x72,0x09,0x81,0xf9,0x70,0x17,0x00,0x00,0x0f,0x94,0xc0,0x5d,0xc3,0x81,0xf9,0x9f,0x0f,0x00,
+    0x00,0x77,0x0c,0xb0 };
+static const uint8_t g_xscan_repl[] = { 0x55,0x48,0x89,0xe5,0xb0,0x01,0x5d,0xc3,0x00,0x00,0x85,0xc9,
+    0x74,0x12,0x81,0xf9,0xcf,0x07,0x00,0x00,0x77,0x15,0x8d,0x51,0xed,0xb0,0x01,0x83,0xfa,0x07,
+    0x72,0x09,0x81,0xf9,0x70,0x17,0x00,0x00,0x0f,0x94,0xc0,0x5d,0xc3,0x81,0xf9,0x9f,0x0f,0x00,
+    0x00,0x77,0x0c,0xb0 };
+static const uint8_t g_xconn_find[] = { 0x55,0x48,0x89,0xe5,0x40,0x88,0x3d,0xcc,0x5f,0x92,0x00,0x5d,0xc3,
+    0x55,0x48,0x89,0xe5,0x40,0x88,0x3d };
+static const uint8_t g_xconn_repl[] = { 0x55,0x48,0x89,0xe5,0xc6,0x05,0xcc,0x5f,0x92,0x00,0x01,0x5d,0xc3,
+    0x55,0x48,0x89,0xe5,0x40,0x88,0x3d };
+static_assert(sizeof(g_xscan_find) == sizeof(g_xscan_repl) && sizeof(g_xconn_find) == sizeof(g_xconn_repl),
+              "a patch changes length");
+
+static UserPatcher::BinaryModPatch g_btd_intel_patches[] = {
+    { CPU_TYPE_X86_64, 0, g_xscan_find, g_xscan_repl, sizeof(g_xscan_find), 0, 1, UserPatcher::FileSegment::SegmentTextText, 1 },
+    { CPU_TYPE_X86_64, 0, g_xconn_find, g_xconn_repl, sizeof(g_xconn_find), 0, 1, UserPatcher::FileSegment::SegmentTextText, 1 },
+};
+
 static UserPatcher::BinaryModInfo g_btd_mod { "/usr/sbin/bluetoothd", g_btd_patches, arrsize(g_btd_patches) };
 static UserPatcher::ProcInfo g_btd_procs[2] = {
     { "/usr/sbin/bluetoothd", sizeof("/usr/sbin/bluetoothd") - 1, 1, UserPatcher::ProcInfo::MatchExact },
@@ -1991,6 +2375,32 @@ static void onCsValidatePage(vnode_t vp, memory_object_t pager, memory_object_of
                 g_n_btd_pages->addValue(1);
         }
     }
+    if (!g_intel) return;
+    for (const auto &patch : g_btd_intel_patches) {
+        if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE,
+                                          patch.find, patch.size, patch.replace, patch.size)) {
+            if (g_n_intel_pages)
+                g_n_intel_pages->addValue(1);
+        }
+    }
+}
+
+/* gIOMatchedNotification on IOUSBHostDevice: notes an Intel controller. USB
+ * enumerates before launchd starts bluetoothd, so this is set before
+ * bluetoothd's pages are validated. Only the vendor is looked at: every Intel
+ * USB device on a laptop's internal hub is its Bluetooth. */
+static bool onIntelCandidate(void *, void *, IOService *svc, IONotifier *)
+{
+    if (svc == nullptr || g_intel) return true;
+    OSNumber *vendor = OSDynamicCast(OSNumber, svc->getProperty("idVendor"));
+    if (vendor == nullptr || vendor->unsigned32BitValue() != 0x8087) return true;
+    g_intel = true;
+    OSNumber *product = OSDynamicCast(OSNumber, svc->getProperty("idProduct"));
+    SYSLOG("broadtek", "Intel Bluetooth 8087:%04x: Intel fixes on",
+           product != nullptr ? product->unsigned32BitValue() : 0);
+    if (IORegistryEntry *platform = IOService::getPlatform())
+        platform->setProperty("broadtek-intel", kOSBooleanTrue);
+    return true;
 }
 
 void BRTK::init()
@@ -2015,6 +2425,29 @@ void BRTK::init()
     markString("broadtek-build", BROADTEK_BUILD);
     markString("broadtek-rewriting", stage);
     mark("broadtek-adv-addr", g_adv_addr);
+
+    /* Intel: on when an Intel Bluetooth device shows up, or always with
+     * -broadtekintel; -broadtekinteloff keeps it off. */
+    if (!checkKernelArgument("-broadtekinteloff")) {
+        intelMakeStaticAddress();
+        g_n_intel_pages      = makeCounter("broadtek-intel-pages");
+        g_n_intel_masked     = makeCounter("broadtek-intel-event-mask");
+        g_n_intel_rand_sent  = makeCounter("broadtek-intel-random-addr");
+        g_n_ready_phy        = makeCounter("broadtek-intel-ready-phy");
+        g_n_ready_dle        = makeCounter("broadtek-intel-ready-dle");
+        g_n_ready_real       = makeCounter("broadtek-intel-ready-real");
+        g_intel_lock = IOSimpleLockAlloc();
+        if (!checkKernelArgument("-broadtekreadyoff"))
+            g_ready_call = thread_call_allocate(intelReadyWork, nullptr);
+        if (checkKernelArgument("-broadtekintel")) {
+            g_intel = true;
+            mark("broadtek-intel", true);
+        } else if (IOService::addMatchingNotification(gIOMatchedNotification,
+                       IOService::serviceMatching("IOUSBHostDevice"),
+                       onIntelCandidate, nullptr, nullptr, 0) == nullptr) {
+            SYSLOG("broadtek", "Intel: notifier failed");
+        }
+    }
     g_n_adv_injected     = makeCounter("broadtek-adv-injected");
     g_n_adv_inj_timeouts = makeCounter("broadtek-adv-inj-timeouts");
     g_n_adv_inj_failed   = makeCounter("broadtek-adv-inj-failed");

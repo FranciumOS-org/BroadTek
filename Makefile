@@ -2,6 +2,8 @@
 #
 #   make test     # the core in userspace, ASan/UBSan
 #   make kext     # build/out/BroadTek.kext (runs the test first)
+#   make release  # build/out/BroadTek-$(VERSION).zip: the kext, the Watch key
+#                 # helper and its install.sh / uninstall.sh
 #
 # Loading the kext is never done from here; see README.md.
 
@@ -11,7 +13,7 @@ CORE      := src/core
 PLUGIN    := src/plugin
 BUILD     := build
 OUT       := $(BUILD)/out
-VERSION   := 0.2.0
+VERSION   := 0.3.0
 
 SDK   := $(shell xcrun --show-sdk-path 2>/dev/null)
 ARCH  := -arch x86_64
@@ -64,7 +66,7 @@ OBJS := $(BUILD)/obj/bt_aes.o $(BUILD)/obj/bt_hci.o $(BUILD)/obj/bt_smp.o \
 BUNDLE := $(OUT)/BroadTek.kext
 BIN    := $(BUNDLE)/Contents/MacOS/BroadTek
 
-.PHONY: all test kext clean probe irk-install dongle-probe nearby-probe map-install
+.PHONY: all test kext release clean probe irk-install dongle-probe nearby-probe map-install
 
 all: kext
 
@@ -180,6 +182,26 @@ kext: test $(OBJS) $(PLUGIN)/Info.plist
 	    -L$(MKSDK)/Library/x86_64 $(OBJS) -lkmod -o $(BIN)
 	@codesign --force --sign - $(BUNDLE) 2>/dev/null || true
 	@echo "  KEXT $(BUNDLE)"
+
+# The release zip. The kext goes into the EFI; install.sh is run afterwards,
+# from macOS, once the kext has booted, and adds the Watch key helper. The
+# helper is stripped: its debug map would carry the build machine's paths.
+REL := $(OUT)/BroadTek-$(VERSION)
+release: kext irk-install
+	@rm -rf $(REL) $(REL).zip
+	@mkdir -p $(REL)/Helper
+	@cp -R $(BUNDLE) $(REL)/
+	@cp $(OUT)/irk_install $(REL)/Helper/broadtek-irk-install
+	@strip -S -x $(REL)/Helper/broadtek-irk-install
+	@codesign -s - --entitlements tools/keychain_probe.entitlements -f $(REL)/Helper/broadtek-irk-install 2>/dev/null
+	@cp tools/irk_session.sh $(REL)/Helper/broadtek-irk-session
+	@cp tools/org.franciumos.broadtek.irk.plist $(REL)/Helper/
+	@cp tools/keychain_probe.entitlements $(REL)/Helper/keychain.entitlements
+	@cp dist/install.sh dist/uninstall.sh LICENSE $(REL)/
+	@chmod 755 $(REL)/install.sh $(REL)/uninstall.sh $(REL)/Helper/broadtek-irk-install $(REL)/Helper/broadtek-irk-session
+	@! LC_ALL=C grep -r -a -l -i "/Users/" $(REL) || { echo "a build path leaked into the release" >&2; exit 1; }
+	@cd $(OUT) && COPYFILE_DISABLE=1 zip -q -r -X BroadTek-$(VERSION).zip BroadTek-$(VERSION)
+	@echo "  ZIP  $(REL).zip"
 
 clean:
 	rm -rf $(BUILD)

@@ -16,10 +16,11 @@ root="$(cd "$here/.." && pwd)"
 label=org.franciumos.broadtek.irk
 plist=/Library/LaunchDaemons/$label.plist
 bin=/usr/local/libexec/broadtek-irk-install
+wrap=/usr/local/libexec/broadtek-irk-session
 
 if [ "${1:-}" = remove ]; then
     launchctl bootout system "$plist" 2>/dev/null || true
-    rm -f "$plist" "$bin"
+    rm -f "$plist" "$bin" "$wrap"
     echo "removed $label"
     exit 0
 fi
@@ -29,14 +30,15 @@ fi
 mkdir -p /usr/local/libexec
 install -m 755 "$root/build/out/irk_install" "$bin"
 codesign -s - --entitlements "$here/keychain_probe.entitlements" -f "$bin" 2>/dev/null
+install -m 755 "$here/irk_session.sh" "$wrap"
 install -m 644 "$here/$label.plist" "$plist"
-chown root:wheel "$plist" "$bin"
+chown root:wheel "$plist" "$bin" "$wrap"
 
 launchctl bootout system "$plist" 2>/dev/null || true
 launchctl bootstrap system "$plist"
 
 echo "installed $label"
-echo "  helper:  $bin"
+echo "  helper:  $bin (run through $wrap)"
 echo "  plist:   $plist"
 echo "  log:     /var/log/broadtek-irk.log  (addresses and statuses only)"
 echo

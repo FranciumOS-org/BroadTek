@@ -9,9 +9,10 @@
 
 # BroadTek
 
-**Broadcom features on Realtek Bluetooth.** A Lilu plugin that makes a
+**Broadcom features on Realtek and Intel Bluetooth.** A Lilu plugin that makes a
 Hackintosh's Bluetooth behave the way macOS expects of a Mac's own Broadcom
-chip, so that an iPhone can find the Mac for **AirDrop** and **Handoff**.
+chip, so that an iPhone can find the Mac for **AirDrop** and **Handoff**, and,
+from 0.3.0, so that an **Apple Watch can unlock it**.
 
 Apple's `bluetoothd` treats any Bluetooth controller it does not know as a
 "third-party dongle" and quietly leaves things out for it. Two of those
@@ -38,29 +39,48 @@ BroadTek ships with [AirPort_RTW89](https://github.com/FranciumOS-org/Airport_RT
 
 ## What works
 
-Measured on an ASUS TUF A15 (RTL8852BE, its Bluetooth on USB `13D3:3571` with
-RealtekBluetoothFirmware and BlueToolFixup), macOS Tahoe 26.7.3, with
-AirPort_RTW89 0.7.0 and an iPhone on iOS 26:
+Measured on an ASUS TUF A15 with macOS Tahoe 26.7.3, an iPhone on iOS 26 and an
+Apple Watch on watchOS 26, with two cards: the RTL8852BE (Bluetooth on USB
+`13D3:3571`, RealtekBluetoothFirmware and BlueToolFixup) and an Intel AX210
+(IntelBluetoothFirmware and BlueToolFixup):
 
-| | |
-|---|---|
-| Bluetooth LE advertising | Starts (`Started advertising successfully`) |
-| AirDrop, iPhone → Mac | Works: the iPhone lists the Mac and sends |
-| AirDrop, Mac → iPhone | Works |
-| Handoff | Works |
-| AirPods, keyboards, mice | Unchanged |
+| | Realtek RTL8852BE | Intel AX210 |
+|---|---|---|
+| Bluetooth LE advertising | Works | Works |
+| AirDrop, both ways | Works | Works |
+| Handoff | Works | Works |
+| Apple Watch unlock (prompts) | Not working | **Works** |
+| Apple Watch unlock (lock screen) | Not working | Untested |
+| AirPods, keyboards, mice | Unchanged | Unchanged |
 
 It works on the HCI stream, not on one chip, so other USB controllers without
-Apple's firmware should behave the same, but none has been tried yet.
+Apple's firmware should behave much the same, but none has been tried yet.
+
+### Apple Watch unlock
+
+On the AX210 the Watch approves the "use your Apple Watch to unlock" prompts
+macOS shows for passwords, settings and apps, including the first one after a
+restart. It needs three things on top of the plain install:
+
+- the `-broadtekrw` boot-arg (BroadTek's full stage),
+- the key helper from the release zip, installed with `install.sh` (below),
+- AMFI off (`amfi_get_out_of_my_way=0x1`). The helper reads the Watch's key
+  from your keychain, where iCloud Keychain has already put it, and macOS gives
+  that key only to Apple's own programs unless AMFI is off.
+
+macOS decides when it asks the Watch, and that is the same as on a real Mac:
+never for the first login after a restart or a log out, and after **Lock
+Screen** (Ctrl-Cmd-Q) only once the display has gone to sleep and been woken.
+
+On Realtek the Watch link stalls the same way it first did on Intel; the fix
+that made Intel work (BroadTek standing in for the PHY Update and Data Length
+Change reports bluetoothd waits for) is applied only to Intel controllers so far.
 
 ## Not working
 
-- **Instant Hotspot and Apple Watch unlock.** Both need the Mac to connect to
-  a device that advertises from a private address, which needs that device's
-  key (IRK), and macOS never hands it to a third-party controller. BroadTek
-  has a software resolving list that does this (`-broadtekrw`), and it got an
-  encrypted link to an Apple Watch, but the unlock then waits on Wi-Fi ranging
-  that no Hackintosh Wi-Fi driver does. Experimental, off by default.
+- **Instant Hotspot.** The Mac has to connect to the iPhone at its private
+  address, which needs the iPhone's key (IRK), and that key is not in the
+  Mac's keychain the way the Watch's is.
 - **iPhone Mirroring.** BroadTek carries the link all the way through pairing,
   then macOS asks the Secure Enclave for a device certificate, and a Hackintosh
   has none. Not fixable in software.
@@ -75,6 +95,8 @@ Apple's firmware should behave the same, but none has been tried yet.
   BlueToolFixup.
 - macOS Tahoe 26.7.x for the advertising fix.
 - For AirDrop: a Wi-Fi driver with AWDL, such as AirPort_RTW89 0.7.0.
+- For Apple Watch unlock: an Intel controller, `-broadtekrw`, AMFI off, and the
+  Watch on the same Apple ID with iCloud Keychain on.
 
 ## Install
 
@@ -96,6 +118,22 @@ off again. Restart after either.
 **By hand:** copy `BroadTek.kext` to `EFI/OC/Kexts` and add it to
 `Kernel → Add` right after Lilu.
 
+On Intel, `efi/install.sh` switches BTLEAdvFixup off if it finds it (the two
+patch the same thing) and `efi/uninstall.sh` switches it back on.
+
+**For Apple Watch unlock**, once the kext is in the EFI, `-broadtekrw` is in
+the boot-args and you have restarted, run from the unzipped release folder:
+
+```sh
+sudo ./install.sh        # adds the Watch key helper to macOS
+```
+
+It checks that BroadTek is running, installs a small LaunchDaemon that hands
+the Watch's key to BroadTek after every login, and waits for the first one.
+Then turn on System Settings → Touch ID & Password → Use Apple Watch to unlock.
+The key is never printed or saved; `/var/log/broadtek-irk.log` holds addresses
+and statuses only. `sudo ./uninstall.sh` removes the helper.
+
 ## Boot-args
 
 | | |
@@ -103,7 +141,9 @@ off again. Restart after either.
 | `-broadtekoff` | BroadTek does nothing |
 | `-broadtekadvaddroff` | leave the adverts' addresses alone |
 | `-broadtekadvoff` | do not patch bluetoothd's advertising check |
-| `-broadtekrw` | experimental: the software resolving list for Instant Hotspot and Watch unlock |
+| `-broadtekrw` | the full stage: the software resolving list, needed for Watch unlock |
+| `-broadtekintel` / `-broadtekinteloff` | force the Intel fixes on, or off (they turn on by themselves for USB vendor `8087`) |
+| `-broadtekreadyoff` | Intel: do not stand in for the link-ready reports |
 | `-broadtekdbg` | Lilu's debug output (in a debug build) |
 
 `ioreg -l | grep -i broadtek` shows what it did: `broadtek-adv-addr`,
@@ -119,6 +159,7 @@ On macOS with the Command Line Tools. Lilu's headers and MacKernelSDK are in
 make test              # the HCI and crypto core in userspace, with ASan/UBSan
 make kext              # build/out/BroadTek.kext, after the test
 make kext DEBUG=0      # the quiet build that releases use
+make release DEBUG=0   # build/out/BroadTek-<version>.zip: kext, helper, install.sh
 ```
 
 ## How it works

@@ -51,6 +51,8 @@ STAGES = {'off': None, 'events': '-broadtekrwev', 'full': '-broadtekrw',
           'fulladv': ('-broadtekrw', '-broadtekadvaddr')}
 OUR_ARGS = ('-broadtekdbg', '-broadtekrw', '-broadtekrwev', '-broadtekoff',
             '-broadtekclass', '-broadtekclassdry', '-broadtekadvaddr')
+RIVAL = 'BTLEAdvFixup.kext'
+RIVAL_MARK = ' (off for BroadTek)'
 NVRAM_GUID = '7C436110-AB2A-4BBB-A880-FE41995C9F82'
 
 
@@ -111,6 +113,14 @@ def install(config, changes, stage='off'):
     if [e.get('BundlePath') for e in add if e.get('BundlePath') in old_order] != old_order:
         changes.append('Kernel -> Add order: BroadTek.kext after Lilu.kext')
 
+    # BTLEAdvFixup does the same job for Intel and patches the same bluetoothd
+    # code; with both loaded each would undo the other's guesses.
+    for e in add:
+        if e.get('BundlePath') == RIVAL and e.get('Enabled'):
+            e['Enabled'] = False
+            e['Comment'] = (e.get('Comment') or '') + RIVAL_MARK
+            changes.append('switched off %s (BroadTek does its job)' % RIVAL)
+
     wanted = [BOOT_ARG]
     chosen = STAGES[stage]
     if isinstance(chosen, tuple):
@@ -125,6 +135,10 @@ def uninstall(config, changes):
         if e.get('BundlePath') == BUNDLE and e.get('Enabled'):
             e['Enabled'] = False
             changes.append('switched off ' + BUNDLE)
+        elif e.get('BundlePath') == RIVAL and RIVAL_MARK in (e.get('Comment') or ''):
+            e['Enabled'] = True
+            e['Comment'] = e['Comment'].replace(RIVAL_MARK, '')
+            changes.append('switched %s back on' % RIVAL)
     set_boot_args(config, changes, [], OUR_ARGS)
 
 

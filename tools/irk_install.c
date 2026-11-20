@@ -81,6 +81,24 @@ static int install(const uint8_t *blob)
     return 1;
 }
 
+/* How many resolving-list entries the kext says are live, from the counter it
+ * publishes on the platform entry; -1 if it cannot be read. */
+static int liveEntries(void)
+{
+    io_registry_entry_t plat = IOServiceGetMatchingService(kIOMainPortDefault,
+                                    IOServiceMatching("IOPlatformExpert"));
+    if (plat == IO_OBJECT_NULL) return -1;
+    CFTypeRef v = IORegistryEntryCreateCFProperty(plat, CFSTR("broadtek-resolving-list"),
+                                                  NULL, 0);
+    IOObjectRelease(plat);
+    if (v == NULL) return -1;
+    long long n = -1;
+    if (CFGetTypeID(v) == CFNumberGetTypeID())
+        CFNumberGetValue(v, kCFNumberLongLongType, &n);
+    CFRelease(v);
+    return (int)n;
+}
+
 /* One pass: read every bond and install it. Returns how many went in. */
 static int runOnce(int reverse, int quiet)
 {
@@ -102,10 +120,11 @@ static int runOnce(int reverse, int quiet)
 
     if (st != errSecSuccess || found == NULL) {
         fprintf(stderr, "no LE bond readable (error %d)%s\n", (int)st,
-                st == errSecMissingEntitlement ? ": entitlement refused" : "");
-        return 1;
+                st == errSecMissingEntitlement ? ": entitlement refused" :
+                st == errSecParam ? ": not in a login session (run through launchctl asuser)" : "");
+        return 0;       /* nothing installed: the caller must not count this */
     }
-    if (CFGetTypeID(found) != CFArrayGetTypeID()) { CFRelease(found); return 1; }
+    if (CFGetTypeID(found) != CFArrayGetTypeID()) { CFRelease(found); return 0; }
 
     CFIndex n = CFArrayGetCount(found);
     printf("%ld bond(s) in the keychain%s\n", (long)n,
@@ -188,10 +207,27 @@ int main(int argc, char **argv)
     const int attempts = 60, gap = 5;       /* five minutes */
     for (int i = 1; i <= attempts; i++) {
         int done = runOnce(reverse, 1);
-        if (done > 0) {
+        if (done > 0 && liveEntries() >= done) {
             printf("installed %d key(s) on attempt %d\n", done, i);
+            /* Early in boot a key the kext accepted has been found missing a
+             * minute later (2026-11-20, cause not pinned down: the kernel log
+             * had wrapped). Keep handing it down for the first two minutes.
+             * Re-installing the same key is harmless: the kext keeps its
+             * state, and the count it publishes is refreshed each time. */
+            int lost = 0;
+            for (int w = 0; w < 24; w++) {
+                sleep(gap);
+                int before = liveEntries();
+                runOnce(reverse, 1);
+                if (before < done) lost++;
+            }
+            printf("kept the key in place for two minutes; %d pass(es) found it missing\n",
+                   lost);
             return 0;
         }
+        if (done > 0)
+            fprintf(stderr, "kext accepted %d key(s) but lists %d live (attempt %d)\n",
+                    done, liveEntries(), i);
         if (i == 1 || i % 6 == 0)
             fprintf(stderr, "nothing installed yet (attempt %d of %d); retrying\n",
                     i, attempts);
