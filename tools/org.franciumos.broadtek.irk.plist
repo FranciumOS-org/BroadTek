@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Installs the peer IRK into BroadTek after every boot.
+     The key lives only in kernel memory, deliberately, so it has to be put
+     there again each time. A daemon rather than an agent because the kext
+     accepts a key only from root. Its log only ever holds addresses and
+     statuses: the key is never printed. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>org.franciumos.broadtek.irk</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/libexec/broadtek-irk-install</string>
+        <string>--wait</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- It exits as soon as a key is in, and gives up after five minutes. -->
+    <key>KeepAlive</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/var/log/broadtek-irk.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/broadtek-irk.log</string>
+</dict>
+</plist>

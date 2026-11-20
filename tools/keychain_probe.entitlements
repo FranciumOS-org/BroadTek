@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Groups a device bond might plausibly live in. Claimed so an exact
+         query can ask; never so a group can be listed. com.apple.rapport is
+         the one to watch: Rapport is Apple's device-to-device framework and
+         Instant Hotspot runs over it. -->
+    <key>keychain-access-groups</key>
+    <array>
+        <string>com.apple.bluetooth</string>
+        <string>com.apple.rapport</string>
+        <string>com.apple.sharing</string>
+        <string>com.apple.identityservices</string>
+        <string>com.apple.coreduetd</string>
+        <string>com.apple.wifi</string>
+        <string>apple</string>
+    </array>
+</dict>
+</plist>
