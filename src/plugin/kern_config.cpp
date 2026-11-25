@@ -19,6 +19,7 @@ static const char *kInstallKey = "broadtek-install-irk";
 static const char *kPromoteKey = "broadtek-promote-captures";
 static const char *kMapKey = "broadtek-install-map";
 static constexpr size_t kMapBlobLen = 1 + 6 + 6;
+static const char *kOwnKey = "broadtek-own-public";
 
 bool BroadTekConfig::start(IOService *provider)
 {
@@ -79,6 +80,12 @@ IOReturn BroadTekConfig::setProperties(OSObject *properties)
                b[6], b[5], b[4], b[3], b[2], b[1],
                b[12], b[11], b[10], b[9], b[8], b[7], ok ? "stored" : "refused");
         result = ok ? kIOReturnSuccess : kIOReturnNoSpace;
+    }
+
+    if (OSNumber *own = OSDynamicCast(OSNumber, dict->getObject(kOwnKey))) {
+        brtkSetOwnPublic(static_cast<uint8_t>(own->unsigned32BitValue()));
+        SYSLOG("broadtek", "own address mode %u", own->unsigned32BitValue());
+        result = kIOReturnSuccess;
     }
 
     if (OSBoolean *promote = OSDynamicCast(OSBoolean, dict->getObject(kPromoteKey))) {

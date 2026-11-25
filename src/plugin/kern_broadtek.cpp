@@ -183,6 +183,10 @@ static OSNumber *g_n_resolved;
 static OSNumber *g_n_substituted;
 static OSNumber *g_n_conn_events;
 static OSNumber *g_n_conn_translated;
+/* The Mac's own address on the connections it starts: see own_public in
+ * bt_core.h. own-asked is "public/random/rpa/rpa-or-random" counts. */
+static OSNumber *g_n_own_mode;
+static OSNumber *g_n_own_to_public;
 
 static OSNumber *g_n_cmd_nobuf;
 static OSNumber *g_n_cmd_short;
@@ -271,6 +275,8 @@ static void publishStatus()
     if (g_n_substituted != nullptr) g_n_substituted->setValue(g_ctx.substituted);
     if (g_n_conn_events != nullptr)     g_n_conn_events->setValue(g_ctx.conn_events);
     if (g_n_conn_translated != nullptr) g_n_conn_translated->setValue(g_ctx.conn_translated);
+    if (g_n_own_mode != nullptr)        g_n_own_mode->setValue(g_ctx.own_public);
+    if (g_n_own_to_public != nullptr)   g_n_own_to_public->setValue(g_ctx.own_to_public);
     if (g_n_write_noprepare != nullptr) g_n_write_noprepare->setValue(g_write_noprepare);
     if (g_n_write_short != nullptr)     g_n_write_short->setValue(g_write_short);
     if (g_n_write_unverified != nullptr)
@@ -842,10 +848,12 @@ static void noteConnTarget(const uint8_t *pkt, size_t len)
     case 0x200d:                                  /* LE Create Connection */
         if (plen < 13) return;
         type = p[5]; addr = &p[6];
+        brtkPublishOwnAsked(p[12]);
         break;
     case 0x2043:                                  /* LE Extended Create Connection */
         if (plen < 10) return;
         type = p[2]; addr = &p[3];
+        brtkPublishOwnAsked(p[1]);
         break;
     default:
         return;
@@ -2251,6 +2259,29 @@ bool brtkInstallMap(const uint8_t *blob, size_t len)
     return ok != 0;
 }
 
+void brtkSetOwnPublic(uint8_t mode)
+{
+    if (g_lock == nullptr) return;
+    IOSimpleLockLock(g_lock);
+    g_ctx.own_public = mode > 2 ? 2 : mode;
+    IOSimpleLockUnlock(g_lock);
+    publishStatus();
+}
+
+/* What bluetoothd asked for, as "public/random/rpa/rpa-or-random" counts.
+ * Caller context only (an allocation). */
+void brtkPublishOwnAsked(uint8_t now)
+{
+    IORegistryEntry *platform = IOService::getPlatform();
+    if (platform == nullptr) return;
+    /* Noted before the core counts this command, so it is added here. */
+    uint32_t n[4] = { g_ctx.own_asked[0], g_ctx.own_asked[1], g_ctx.own_asked[2], g_ctx.own_asked[3] };
+    if (now <= 3) n[now]++;
+    char line[64];
+    snprintf(line, sizeof(line), "%u/%u/%u/%u last %u", n[0], n[1], n[2], n[3], now);
+    platform->setProperty("broadtek-own-asked", line);
+}
+
 int brtkPromoteCaptures()
 {
     if (g_lock == nullptr) return 0;
@@ -2417,6 +2448,12 @@ void BRTK::init()
     g_adv_addr = !checkKernelArgument("-broadtekadvaddroff");
     g_lock = IOSimpleLockAlloc();
     bt_ctx_init(&g_ctx);
+    /* Connections the Mac starts go out from its public address: bluetoothd
+     * asks for a random one (type 1), and the controller refuses its LE Set
+     * Random Address with Command Disallowed often enough that the address
+     * in use is a stale one no bonded device knows. -broadtekownrandom asks
+     * for the old mapping (own type 2/3 -> random, 1 left alone). */
+    g_ctx.own_public = checkKernelArgument("-broadtekownrandom") ? 0 : 2;
     for (int i = 0; i < kSlots; i++) g_slots[i].busy = 0;
 
     const char *stage = g_rw_cmds ? "full" : (g_rw_events ? "events" : "off");
@@ -2471,6 +2508,8 @@ void BRTK::init()
     g_n_substituted = makeCounter("broadtek-substituted");
     g_n_conn_events     = makeCounter("broadtek-conn-events");
     g_n_conn_translated = makeCounter("broadtek-conn-translated");
+    g_n_own_mode        = makeCounter("broadtek-own-public");
+    g_n_own_to_public   = makeCounter("broadtek-own-to-public");
     g_n_write_noprepare  = makeCounter("broadtek-write-noprepare");
     g_n_write_short      = makeCounter("broadtek-write-short");
     g_n_cmd_rebuffered      = makeCounter("broadtek-cmd-rebuffered");

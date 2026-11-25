@@ -18,6 +18,12 @@ bool brtkInstallKey(const uint8_t *blob, size_t len);
  * Returns true if it was stored. */
 bool brtkInstallMap(const uint8_t *blob, size_t len);
 
+/* The own address type for connections the Mac starts: 0 random (old),
+ * 1 public instead of a controller RPA, 2 public always. */
+void brtkSetOwnPublic(uint8_t mode);
+/* Publish the own address types bluetoothd asked for. Caller context. */
+void brtkPublishOwnAsked(uint8_t now);
+
 /* Move finished ACL-side captures into the resolving list. */
 int brtkPromoteCaptures();
 

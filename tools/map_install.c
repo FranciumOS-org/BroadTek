@@ -209,6 +209,23 @@ static int install(const uint8_t *blob)
     return 1;
 }
 
+/* broadtek-own-public: the Mac's own address on connections it starts. */
+static int setOwn(int mode)
+{
+    io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault,
+                                                   IOServiceMatching("BroadTekConfig"));
+    if (svc == IO_OBJECT_NULL) { fprintf(stderr, "BroadTekConfig not found\n"); return 0; }
+    CFNumberRef n = CFNumberCreate(NULL, kCFNumberIntType, &mode);
+    CFStringRef key = CFSTR("broadtek-own-public");
+    CFDictionaryRef props = CFDictionaryCreate(NULL, (const void **)&key, (const void **)&n, 1,
+                                               &kCFTypeDictionaryKeyCallBacks,
+                                               &kCFTypeDictionaryValueCallBacks);
+    kern_return_t kr = IORegistryEntrySetCFProperties(svc, (CFTypeRef)props);
+    CFRelease(props); CFRelease(n); IOObjectRelease(svc);
+    if (kr != KERN_SUCCESS) { fprintf(stderr, "refused: 0x%x\n", kr); return 0; }
+    return 1;
+}
+
 static int runOnce(int quiet)
 {
     struct pair air[MAX_PAIRS], ident[MAX_PAIRS];
@@ -270,7 +287,14 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--loop") == 0) loop = 1;
         else if (strcmp(argv[i], "--quiet") == 0) quiet = 1;
-        else { printf("usage: sudo %s [--loop] [--quiet]\n", argv[0]); return 2; }
+        else if (strcmp(argv[i], "--own") == 0 && i + 1 < argc) {
+            int m = atoi(argv[++i]);
+            if (m < 0 || m > 2) { printf("--own takes 0, 1 or 2\n"); return 2; }
+            int ok = setOwn(m);
+            printf("own address mode %d: %s\n", m, ok ? "set" : "refused");
+            return ok ? 0 : 1;
+        }
+        else { printf("usage: sudo %s [--loop] [--quiet] [--own 0|1|2]\n", argv[0]); return 2; }
     }
 
     if (!loop) {

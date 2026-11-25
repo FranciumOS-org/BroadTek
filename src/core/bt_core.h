@@ -79,6 +79,20 @@ struct bt_ctx {
      * not recognise the device it just connected to. */
     uint32_t conn_events;        /* LE Connection Complete, plain or enhanced */
     uint32_t conn_translated;    /* ... whose peer address was put back */
+
+    /* The Mac's own address on a connection it starts. With own address
+     * type random (1, what bluetoothd asks for) or a controller RPA (2/3,
+     * mapped to 1) the controller uses whatever random address it last
+     * accepted. bluetoothd's LE Set Random Address is often refused (Command
+     * Disallowed), so that address can be one no bonded device knows, and
+     * they refuse encryption ("PIN or key missing"). own_public picks:
+     *   0  2/3 -> 1, random (the old behaviour)
+     *   1  2/3 -> 0, public: the identity address the bonded devices hold
+     *   2  1/2/3 -> 0, every connection from the public address (the
+     *      kext's default) */
+    uint8_t  own_public;
+    uint32_t own_asked[4];       /* own address types bluetoothd asked for */
+    uint32_t own_to_public;      /* ... and how many went out as public */
 };
 
 enum bt_verdict {

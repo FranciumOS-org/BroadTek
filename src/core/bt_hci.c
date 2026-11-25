@@ -100,6 +100,17 @@ static struct bt_pending *take_pending(struct bt_ctx *c, uint16_t opcode)
 /* The address the controller should really be told about: an identity address
  * BroadTek has an IRK and a current RPA for is replaced by that RPA, so the
  * controller's own accept list and connection attempts work unchanged. */
+/* The own address type a connection goes out with; see own_public. */
+static uint8_t own_type(struct bt_ctx *c, uint8_t t)
+{
+    if (t <= 3) c->own_asked[t]++;
+    if (t >= 0x02 || (t == 0x01 && c->own_public >= 2)) {
+        if (c->own_public >= 1) { c->own_to_public++; return 0x00; }
+        return (uint8_t)(t & 1);
+    }
+    return t;
+}
+
 static int substitute(struct bt_ctx *c, uint8_t *type, uint8_t *addr)
 {
     struct bt_rl_entry *e = rl_find(c, *type, addr);
@@ -247,14 +258,14 @@ enum bt_verdict bt_hci_on_command(struct bt_ctx *c, uint8_t *pkt, size_t len)
         /* interval(2) window(2) policy(1) peer_type(1) peer[6] own_type(1) ... */
         if (plen < 13) break;
         if (p[4] == 0) substitute(c, &p[5], &p[6]);
-        if (p[12] >= 0x02) p[12] = (uint8_t)(p[12] & 1);   /* own type 2/3 -> 0/1 */
+        p[12] = own_type(c, p[12]);
         break;
 
     case OP_LE_EXT_CREATE_CONN:
         /* policy(1) own_type(1) peer_type(1) peer[6] phys(1) ... */
         if (plen < 10) break;
         if (p[0] == 0) substitute(c, &p[2], &p[3]);
-        if (p[1] >= 0x02) p[1] = (uint8_t)(p[1] & 1);
+        p[1] = own_type(c, p[1]);
         break;
 
     default:

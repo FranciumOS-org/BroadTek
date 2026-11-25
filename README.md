@@ -144,7 +144,14 @@ and statuses only. `sudo ./uninstall.sh` removes the helper.
 | `-broadtekrw` | the full stage: the software resolving list, needed for Watch unlock |
 | `-broadtekintel` / `-broadtekinteloff` | force the Intel fixes on, or off (they turn on by themselves for USB vendor `8087`) |
 | `-broadtekreadyoff` | Intel: do not stand in for the link-ready reports |
+| `-broadtekownrandom` | connect from the controller's random address, not the Mac's public one (see below) |
 | `-broadtekdbg` | Lilu's debug output (in a debug build) |
+
+Connections the Mac starts go out from its public address. bluetoothd asks
+for a random one, but the controller often refuses the command that sets it,
+and a stale random address is one the Watch and iPhone do not know: they
+refuse to encrypt and Watch unlock fails. `sudo build/out/map_install --own N`
+changes this without a restart: 0 the old behaviour, 2 the default.
 
 `ioreg -l | grep -i broadtek` shows what it did: `broadtek-adv-addr`,
 `broadtek-adv-injected` (adverts given their address) and the counters of

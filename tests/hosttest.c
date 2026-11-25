@@ -658,6 +658,48 @@ static void test_install_full(void)
     CHECK(bt_rl_install(&c, 0x00, addr, spec_irk) == 0, "a full list must refuse");
 }
 
+/* The Mac's own address on a connection it starts: bluetoothd asks for a
+ * controller-generated RPA (2/3), which this controller cannot make. */
+static void test_own_address(void)
+{
+    struct bt_ctx c;
+    bt_ctx_init(&c);
+
+    uint8_t legacy[3 + 25] = {0x0d, 0x20, 25, 0x60,0x00, 0x30,0x00, 0x01, 0x00};
+    uint8_t ext[3 + 26] = {0x43, 0x20, 26, 0x01, 0x03, 0x00};
+
+    /* Mode 0, the old mapping: 3 -> random. */
+    legacy[15] = 0x03;
+    bt_hci_on_command(&c, legacy, sizeof(legacy));
+    CHECK(legacy[15] == 0x01, "mode 0: own type 3 must become random, got %02x", legacy[15]);
+
+    /* Mode 1: an RPA request goes out from the public address. */
+    c.own_public = 1;
+    legacy[15] = 0x03;
+    bt_hci_on_command(&c, legacy, sizeof(legacy));
+    CHECK(legacy[15] == 0x00, "mode 1: own type 3 must become public, got %02x", legacy[15]);
+    ext[4] = 0x02;
+    bt_hci_on_command(&c, ext, sizeof(ext));
+    CHECK(ext[4] == 0x00, "mode 1: extended own type 2 must become public, got %02x", ext[4]);
+    ext[4] = 0x01;
+    bt_hci_on_command(&c, ext, sizeof(ext));
+    CHECK(ext[4] == 0x01, "mode 1: a plain random request is left alone, got %02x", ext[4]);
+
+    /* Mode 2: random too. */
+    c.own_public = 2;
+    legacy[15] = 0x01;
+    bt_hci_on_command(&c, legacy, sizeof(legacy));
+    CHECK(legacy[15] == 0x00, "mode 2: own type 1 must become public, got %02x", legacy[15]);
+    legacy[15] = 0x00;
+    bt_hci_on_command(&c, legacy, sizeof(legacy));
+    CHECK(legacy[15] == 0x00, "public stays public");
+
+    CHECK(c.own_asked[0] == 1 && c.own_asked[1] == 2 && c.own_asked[2] == 1 &&
+          c.own_asked[3] == 2, "asked counts %u/%u/%u/%u", c.own_asked[0],
+          c.own_asked[1], c.own_asked[2], c.own_asked[3]);
+    CHECK(c.own_to_public == 3, "three went out as public, got %u", c.own_to_public);
+}
+
 int main(void)
 {
     printf("BroadTek core test\n");
@@ -678,6 +720,7 @@ int main(void)
     test_promote();
     test_install_full();
     test_install_map();
+    test_own_address();
     if (fails) { printf("%d failure(s)\n", fails); return 1; }
     printf("all checks passed\n");
     return 0;
